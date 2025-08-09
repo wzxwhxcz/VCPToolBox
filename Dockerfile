@@ -1,81 +1,93 @@
 # =================================================================
-# Stage 1: Build
+# Stage 1: Build Stage - 用于编译和安装所有依赖
 # =================================================================
 FROM node:20-alpine AS build
+
+# 设置工作目录
 WORKDIR /usr/src/app
 
-# 加速源
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
-
-# 关键：补齐 git 与 sharp 所需的 vips-dev；并保留构建链
+# 安装基础工具
 RUN apk add --no-cache \
-  tzdata python3 py3-pip build-base gfortran musl-dev \
-  lapack-dev openblas-dev jpeg-dev zlib-dev freetype-dev python3-dev \
-  linux-headers libffi-dev openssl-dev \
-  git pkgconfig vips-dev
+  python3 \
+  py3-pip \
+  make \
+  g++ \
+  git
 
-# puppeteer 不下载 chromium
-ARG PUPPETEER_SKIP_DOWNLOAD=true
-ENV PUPPETEER_SKIP_DOWNLOAD=${PUPPETEER_SKIP_DOWNLOAD}
-
-# 用官方 npm 源更稳定；并减少 peer 冲突噪音
-ENV NPM_CONFIG_REGISTRY=https://registry.npmjs.org
-ENV npm_config_fund=false npm_config_audit=false
-
+# 复制 package.json 和 package-lock.json
 COPY package*.json ./
-RUN npm ci --omit=dev || npm install --omit=dev --legacy-peer-deps
 
+# 安装主项目依赖
+RUN npm ci || npm install
+
+# 复制 Python 依赖文件（如果存在）
 COPY requirements.txt ./
-RUN pip3 install --no-cache-dir --break-system-packages \
-    --target=/usr/src/app/pydeps \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt || true
 
+# 复制所有源代码
 COPY . .
 
-# 逐插件安装：打印出失败的目录，便于定位
-RUN set -eux; \
-  for pkg in $(find Plugin -name package.json || true); do \
-    d="$(dirname "$pkg")"; \
-    echo ">>> Installing Node deps in $d"; \
-    (cd "$d" && npm install --omit=dev --legacy-peer-deps) || { echo "!!! Failed in $d"; exit 1; }; \
-  done
+# 查找并安装插件的 npm 依赖（简化版本，忽略错误）
+RUN for dir in Plugin/*/; do \
+    if [ -f "$dir/package.json" ]; then \
+        echo "Installing dependencies in $dir"; \
+        (cd "$dir" && npm install --legacy-peer-deps) || echo "Warning: Failed to install deps in $dir"; \
+    fi; \
+done
+
+# 查找并安装插件的 Python 依赖（忽略错误）
+RUN for req in Plugin/*/requirements.txt; do \
+    if [ -f "$req" ]; then \
+        echo "Installing Python deps from $req"; \
+        pip3 install --no-cache-dir --break-system-packages -r "$req" || echo "Warning: Failed to install $req"; \
+    fi; \
+done
 
 # =================================================================
-# Stage 2: Runtime
+# Stage 2: Production Stage - 最终的轻量运行环境
 # =================================================================
 FROM node:20-alpine
+
+# 设置工作目录
 WORKDIR /usr/src/app
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
-  apk add --no-cache chromium nss freetype harfbuzz ttf-freefont tzdata \
-                      python3 openblas jpeg zlib freetype libffi
 
-ENV PYTHONPATH=/usr/src/app/pydeps
-# Alpine 的可执行一般是 chromium-browser（也可能是 chromium，自测下）
+# 安装运行时依赖
+RUN apk add --no-cache \
+  python3 \
+  py3-pip \
+  tzdata \
+  chromium \
+  nss \
+  freetype \
+  harfbuzz \
+  ttf-freefont
+
+# 设置时区
+RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+  echo "Asia/Shanghai" > /etc/timezone
+
+# 设置环境变量
+ENV PYTHONPATH=/usr/src/app
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 
-RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo "Asia/Shanghai" > /etc/timezone
+# 从构建阶段复制应用和依赖
+COPY --from=build /usr/src/app /usr/src/app
 
-COPY --from=build /usr/src/app/node_modules ./node_modules
-COPY --from=build /usr/src/app/package*.json ./
-COPY --from=build /usr/src/app/pydeps ./pydeps
-COPY --from=build /usr/src/app/*.js ./
-COPY --from=build /usr/src/app/Plugin ./Plugin
-COPY --from=build /usr/src/app/Agent ./Agent
-COPY --from=build /usr/src/app/routes ./routes
-COPY --from=build /usr/src/app/requirements.txt ./
+# 创建必要的目录
+RUN mkdir -p \
+  /usr/src/app/VCPTimedContacts \
+  /usr/src/app/dailynote \
+  /usr/src/app/image \
+  /usr/src/app/file \
+  /usr/src/app/TVStxt \
+  /usr/src/app/VCPAsyncResults \
+  /usr/src/app/Plugin/VCPLog/log \
+  /usr/src/app/Plugin/EmojiListGenerator/generated_lists \
+  /usr/src/app/DebugLog
 
-RUN mkdir -p /usr/src/app/VCPTimedContacts \
-             /usr/src/app/dailynote \
-             /usr/src/app/image \
-             /usr/src/app/file \
-             /usr/src/app/TVStxt \
-             /usr/src/app/VCPAsyncResults \
-             /usr/src/app/Plugin/VCPLog/log \
-             /usr/src/app/Plugin/EmojiListGenerator/generated_lists
+# 暴露端口
+EXPOSE 6005
 
-# 端口改为 VCP 实际用到的两个：HTTP 和 WebSocket
-EXPOSE 5890 8088
-
-# 如果你确认用 pm2，保证 package.json 里含 pm2 依赖；否则用 node 直接起
-CMD ["node_modules/.bin/pm2-runtime","start","server.js"]
-# 或：CMD ["node","server.js"]
+# 启动命令
+CMD ["node", "server.js"]
